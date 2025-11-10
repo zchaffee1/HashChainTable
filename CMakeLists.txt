@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Compile-time configuration options
-set(IMPLEMENTATION "1" CACHE STRING "Implementation version (1=multi-file, 2=single-file, 3=in-memory)")
+set(IMPLEMENTATION "1" CACHE STRING "Implementation version (1=multi-file, 2=single-file, 3=in-memory, 4=rainbow)")
 set(K_VALUE "32" CACHE STRING "K value for table size (2^K entries)")
 set(NONCE_SIZE "6" CACHE STRING "Size of nonce in bytes")
 set(HASH_SIZE "10" CACHE STRING "Size of hash in bytes")
@@ -16,7 +16,7 @@ set(BUCKET_CAPACITY "512" CACHE STRING "Logical capacity per bucket")
 set(NUM_WORKER_THREADS "8" CACHE STRING "Number of worker threads")
 set(NUM_IO_THREADS "2" CACHE STRING "Number of I/O threads")
 set(WORKER_BUFFER_SIZE "65536" CACHE STRING "Buffer size per worker thread")
-set(MEMORY_LIMIT_MB "2048" CACHE STRING "Memory limit in MB (for implementations 2 and 3)")
+set(MEMORY_LIMIT_MB "2048" CACHE STRING "Memory limit in MB (for implementations 2, 3, and 4)")
 option(ENABLE_BENCHMARKING "Enable detailed benchmarking and statistics" ON)
 
 # Build type optimization
@@ -51,7 +51,7 @@ else()
 endif()
 
 message(STATUS "Implementation: ${IMPLEMENTATION}")
-if(IMPLEMENTATION EQUAL 2 OR IMPLEMENTATION EQUAL 3)
+if(IMPLEMENTATION EQUAL 2 OR IMPLEMENTATION EQUAL 3 OR IMPLEMENTATION EQUAL 4)
     message(STATUS "Memory Limit: ${MEMORY_LIMIT_MB} MB")
 endif()
 
@@ -103,8 +103,18 @@ elseif(IMPLEMENTATION EQUAL 3)
         src/verifier_v3.cpp
     )
     message(STATUS "Building Implementation 3: In-memory with dynamic nonce size")
+elseif(IMPLEMENTATION EQUAL 4)
+    set(IMPL_SOURCES
+        src/main_v4.cpp
+        src/rainbow_table_generator.cpp
+    )
+    set(VERIFIER_SOURCES
+        src/verify_main_v4.cpp
+        src/rainbow_verifier.cpp
+    )
+    message(STATUS "Building Implementation 4: Rainbow tables")
 else()
-    message(FATAL_ERROR "Invalid IMPLEMENTATION value. Must be 1, 2, or 3.")
+    message(FATAL_ERROR "Invalid IMPLEMENTATION value. Must be 1, 2, 3, or 4.")
 endif()
 
 # Main executable

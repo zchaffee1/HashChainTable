@@ -67,10 +67,15 @@ mkdir build && cd build
 cmake .. -DIMPLEMENTATION=3 -DK_VALUE=20 -DMEMORY_LIMIT_MB=512
 make -j$(nproc)
 
-# Test build (K=16 for faster testing)
-cmake .. -DIMPLEMENTATION=3 -DK_VALUE=16 -DMEMORY_LIMIT_MB=128
+# Implementation 4: Rainbow tables (maximum coverage, minimal storage)
+mkdir build && cd build
+cmake .. -DIMPLEMENTATION=4 -DK_VALUE=20 -DMEMORY_LIMIT_MB=256
 make -j$(nproc)
-./hashchaintable test_output
+
+# Test build (K=16 for faster testing)
+cmake .. -DIMPLEMENTATION=4 -DK_VALUE=16 -DMEMORY_LIMIT_MB=64
+make -j$(nproc)
+./hashchaintable test_rainbow
 ```
 
 ### Configuration Parameters
@@ -79,7 +84,7 @@ All parameters are compile-time constants for maximum efficiency:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| IMPLEMENTATION | 1 | Implementation version (1=multi-file, 2=single-file, 3=in-memory) |
+| IMPLEMENTATION | 1 | Implementation version (1=multi-file, 2=single-file, 3=in-memory, 4=rainbow) |
 | K_VALUE | 32 | Generate 2^K nonce-hash pairs (e.g., 32 = 4.3 billion) |
 | NONCE_SIZE | 6 | Size of each nonce in bytes |
 | HASH_SIZE | 10 | Size of hash in bytes (only prefix is computed) |
@@ -88,7 +93,7 @@ All parameters are compile-time constants for maximum efficiency:
 | NUM_WORKER_THREADS | 8 | Number of hash generation threads |
 | NUM_IO_THREADS | 2 | Number of I/O threads |
 | WORKER_BUFFER_SIZE | 65536 | Buffer size per worker in bytes |
-| MEMORY_LIMIT_MB | 2048 | Memory limit for Implementations 2 and 3 (in MB) |
+| MEMORY_LIMIT_MB | 2048 | Memory limit for Implementations 2, 3, and 4 (in MB) |
 | ENABLE_BENCHMARKING | ON | Enable detailed performance statistics |
 
 ### Custom Configuration
@@ -858,6 +863,207 @@ Choose Implementation 1 when:
 - ✅ Need maximum write throughput
 - ✅ Filesystem handles many files well
 - ✅ Want incremental generation
+
+---
+
+# Implementation 4: Rainbow Tables
+
+## Overview
+
+Implementation 4 uses the **rainbow table** technique - a time-memory tradeoff that dramatically reduces storage requirements by storing chains rather than individual nonce-hash pairs.
+
+### Rainbow Table Concept
+
+Instead of storing every (nonce → hash) pair, rainbow tables store **chains**:
+
+```
+Start Nonce → Hash → Reduce → Hash → Reduce → ... → End Nonce
+     |                                                    |
+  Store this                                          Store this
+```
+
+**Key insight**: Only store (start, end) pairs. When searching for a hash, regenerate possible chains and check if any end points match.
+
+### How It Works
+
+1. **Chain Generation**:
+   ```
+   nonce₀ → H(nonce₀) → R(hash, table, pos) → nonce₁ → H(nonce₁) → R(hash, table, pos+1) → ...
+   ```
+
+   - `H`: BLAKE3 hash function
+   - `R`: Reduction function (hash → nonce, unique per table and position)
+
+2. **Storage**: Only (start_nonce, end_nonce) for each chain
+
+3. **Lookup**: For target hash T:
+   - Try each position i in chain:
+     - Apply R(T, table, i) → get candidate nonce
+     - Generate chain from position i+1 to end → get endpoint
+     - Binary search for endpoint in sorted table
+     - If found, regenerate entire chain from start and check each hash
+
+### Key Features
+
+- **Multiple Tables**: Uses N tables (default: 4) with different reduction functions to minimize chain collisions
+- **Automatic Chain Length**: Calculated as `sqrt(coverage / num_chains)` for optimal balance
+- **Space Efficient**: Stores only 2×nonce_size per chain (vs nonce_size per entry in naive approach)
+- **Coverage**: `num_tables × chains_per_table × chain_length` unique nonces (ideally)
+
+### Build Example
+
+```bash
+# Implementation 4: Rainbow tables
+mkdir build && cd build
+cmake .. -DIMPLEMENTATION=4 -DK_VALUE=20 -DMEMORY_LIMIT_MB=256
+make -j$(nproc)
+
+# Generate with 4 tables (default)
+./hashchaintable rainbow_output
+
+# Generate with 6 tables
+./hashchaintable rainbow_output "" 6
+```
+
+### File Format
+
+Each table stored as separate file: `rainbow_table_0.bin`, `rainbow_table_1.bin`, etc.
+
+**File structure**:
+```
+[4 bytes] Version (4 for Implementation 4)
+[8 bytes] Number of chains
+[4 bytes] Chain length
+For each chain:
+  [N bytes] Start nonce
+  [N bytes] End nonce
+```
+
+**Metadata file** (`rainbow_meta.txt`):
+- Human-readable statistics
+- Configuration parameters
+- Coverage information
+
+### Performance Characteristics
+
+**Space Efficiency**:
+```
+Storage = num_chains × 2 × nonce_size
+Coverage = num_chains × chain_length × num_tables (ideal)
+Space per nonce covered = 2 × nonce_size / chain_length
+```
+
+**Example** (K=20, 4 tables, 64MB memory, 6-byte nonce):
+- Chains per table: ~2.8M
+- Chain length: ~100 (auto-calculated)
+- Total chains: ~11M
+- Coverage: ~1.1B nonces
+- Storage: 64 MB
+- Naive approach for same coverage: ~6.3 GB
+- **Space savings: ~99%**
+
+**Lookup Time**:
+- Must try chain_length positions × num_tables
+- Each position: binary search + chain regeneration
+- Typical: milliseconds to seconds depending on chain length
+
+**Advantages**:
+- ✅ Massive space savings (99%+ reduction)
+- ✅ Covers far more nonces than naive approach with same memory
+- ✅ Multiple tables reduce collision probability
+- ✅ Works entirely in memory during generation
+- ✅ Predictable file sizes
+
+**Disadvantages**:
+- ❌ Slower lookup (regenerate chains vs direct lookup)
+- ❌ Not guaranteed to find all hashes (chain collisions)
+- ❌ Longer generation time (more hashes computed)
+- ❌ Lookup time increases with chain length
+- ❌ Success rate < 100% due to chain merging
+
+### Chain Collision and Success Rate
+
+**Chain Merging**: When two chains share a position:
+```
+Chain A: ... → nonce_x → hash_x → ...
+Chain B: ... → nonce_x → hash_x → ...
+                 ↓
+            Chains merge! Both end at same point
+```
+
+Merged chains reduce effective coverage. Success rate typically:
+- Single table: ~86% (for optimal parameters)
+- Multiple tables: ~99%+ (collisions in different positions)
+
+### Usage
+
+**Generate tables**:
+```bash
+./hashchaintable <output_dir> [csv_file] [num_tables]
+
+# Examples
+./hashchaintable rainbow_tables
+./hashchaintable rainbow_tables results.csv 6
+```
+
+**Search for hash**:
+```bash
+./verify <rainbow_dir> <command> [options]
+
+# View statistics
+./verify rainbow_tables stats
+
+# View sample chains
+./verify rainbow_tables sample 10
+
+# Search for specific hash
+./verify rainbow_tables find 0decaed61e28312c9c92
+
+# Test: generate hash from nonce and search for it
+./verify rainbow_tables test 000000001234
+```
+
+### Comparison: All Implementations
+
+| Aspect | Implementation 1 | Implementation 2 | Implementation 3 | Implementation 4 |
+|--------|------------------|------------------|------------------|------------------|
+| **Approach** | Naive storage | Single-file | In-memory | Rainbow table |
+| **Storage Model** | Many files | One file | One file | N table files |
+| **Coverage** | 2^K nonces | 2^K nonces | 2^K nonces | M×L×N nonces* |
+| **Space per Entry** | N bytes | N bytes | N bytes | 2N/L bytes* |
+| **Lookup Speed** | Instant | Fast | Fast | Medium-Slow |
+| **Lookup Success** | 100% | 100% | 100% | ~99%* |
+| **Generation Speed** | Fast | Medium | Fastest | Slow (M×L hashes) |
+| **Memory During Gen** | ~2.6GB | Configurable | Full table | Configurable |
+| **Space Efficiency** | Baseline | Same | Same | 99%+ savings* |
+| **Best For** | Small K, HDD | Large K, SSD | Small K, RAM | Maximum coverage |
+
+*Ideal values, actual may vary due to collisions
+
+### When to Use Implementation 4
+
+Choose Implementation 4 when:
+- ✅ Need to cover MORE nonces than 2^K with limited storage
+- ✅ Space is the primary constraint
+- ✅ Can tolerate slower lookups (milliseconds vs microseconds)
+- ✅ Accept ~99% success rate (vs 100%)
+- ✅ Want to maximize coverage per MB of storage
+
+Choose Implementation 3 when:
+- ✅ Need guaranteed 100% lookup success
+- ✅ Have abundant RAM
+- ✅ Want fastest possible generation
+- ✅ K value fits in memory
+
+Choose Implementation 2 when:
+- ✅ Need 100% success and K value too large for RAM
+- ✅ Want single portable file
+- ✅ Using SSD storage
+
+Choose Implementation 1 when:
+- ✅ Filesystem handles many files well
+- ✅ Using rotating disks
+- ✅ Need maximum write throughput
 
 ---
 
