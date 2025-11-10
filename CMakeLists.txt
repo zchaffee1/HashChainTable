@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Compile-time configuration options
+set(IMPLEMENTATION "1" CACHE STRING "Implementation version (1=multi-file, 2=single-file)")
 set(K_VALUE "32" CACHE STRING "K value for table size (2^K entries)")
 set(NONCE_SIZE "6" CACHE STRING "Size of nonce in bytes")
 set(HASH_SIZE "10" CACHE STRING "Size of hash in bytes")
@@ -15,6 +16,7 @@ set(BUCKET_CAPACITY "512" CACHE STRING "Logical capacity per bucket")
 set(NUM_WORKER_THREADS "8" CACHE STRING "Number of worker threads")
 set(NUM_IO_THREADS "2" CACHE STRING "Number of I/O threads")
 set(WORKER_BUFFER_SIZE "65536" CACHE STRING "Buffer size per worker thread")
+set(MEMORY_LIMIT_MB "2048" CACHE STRING "Memory limit in MB (for implementation 2)")
 option(ENABLE_BENCHMARKING "Enable detailed benchmarking and statistics" ON)
 
 # Build type optimization
@@ -29,6 +31,7 @@ set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
 
 # Add compile definitions for all parameters
 add_compile_definitions(
+    IMPLEMENTATION=${IMPLEMENTATION}
     K_VALUE=${K_VALUE}
     NONCE_SIZE=${NONCE_SIZE}
     HASH_SIZE=${HASH_SIZE}
@@ -37,6 +40,7 @@ add_compile_definitions(
     NUM_WORKER_THREADS=${NUM_WORKER_THREADS}
     NUM_IO_THREADS=${NUM_IO_THREADS}
     WORKER_BUFFER_SIZE=${WORKER_BUFFER_SIZE}
+    MEMORY_LIMIT_MB=${MEMORY_LIMIT_MB}
 )
 
 if(ENABLE_BENCHMARKING)
@@ -44,6 +48,11 @@ if(ENABLE_BENCHMARKING)
     message(STATUS "Benchmarking: Enabled")
 else()
     message(STATUS "Benchmarking: Disabled")
+endif()
+
+message(STATUS "Implementation: ${IMPLEMENTATION}")
+if(IMPLEMENTATION EQUAL 2)
+    message(STATUS "Memory Limit: ${MEMORY_LIMIT_MB} MB")
 endif()
 
 # Include directories
@@ -54,24 +63,44 @@ include_directories(${CMAKE_SOURCE_DIR}/external/blake3)
 # BLAKE3 library
 add_subdirectory(external/blake3)
 
-# Source files
-set(SOURCES
-    src/main.cpp
+# Common sources
+set(COMMON_SOURCES
     src/hash_generator.cpp
-    src/bucket_manager.cpp
-    src/thread_pool.cpp
     src/benchmark.cpp
 )
 
+# Implementation-specific sources
+if(IMPLEMENTATION EQUAL 1)
+    set(IMPL_SOURCES
+        src/main.cpp
+        src/bucket_manager.cpp
+        src/thread_pool.cpp
+    )
+    set(VERIFIER_SOURCES
+        src/verify_main.cpp
+        src/verifier.cpp
+    )
+    message(STATUS "Building Implementation 1: Multi-file with separate buckets")
+elseif(IMPLEMENTATION EQUAL 2)
+    set(IMPL_SOURCES
+        src/main_v2.cpp
+        src/bucket_manager_v2.cpp
+        src/thread_pool_v2.cpp
+    )
+    set(VERIFIER_SOURCES
+        src/verify_main_v2.cpp
+        src/verifier_v2.cpp
+    )
+    message(STATUS "Building Implementation 2: Single-file with offsets")
+else()
+    message(FATAL_ERROR "Invalid IMPLEMENTATION value. Must be 1 or 2.")
+endif()
+
 # Main executable
-add_executable(hashchaintable ${SOURCES})
+add_executable(hashchaintable ${IMPL_SOURCES} ${COMMON_SOURCES})
 target_link_libraries(hashchaintable PRIVATE blake3 pthread)
 
 # Verifier executable
-set(VERIFIER_SOURCES
-    src/verify_main.cpp
-    src/verifier.cpp
-)
 add_executable(verify ${VERIFIER_SOURCES})
 target_link_libraries(verify PRIVATE blake3)
 
