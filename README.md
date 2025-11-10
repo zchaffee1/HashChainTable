@@ -62,8 +62,13 @@ mkdir build && cd build
 cmake .. -DIMPLEMENTATION=2 -DMEMORY_LIMIT_MB=2048
 make -j$(nproc)
 
-# Test build (K=24 for faster testing)
-cmake .. -DIMPLEMENTATION=2 -DK_VALUE=24 -DMEMORY_LIMIT_MB=512
+# Implementation 3: In-memory with dynamic nonce size
+mkdir build && cd build
+cmake .. -DIMPLEMENTATION=3 -DK_VALUE=20 -DMEMORY_LIMIT_MB=512
+make -j$(nproc)
+
+# Test build (K=16 for faster testing)
+cmake .. -DIMPLEMENTATION=3 -DK_VALUE=16 -DMEMORY_LIMIT_MB=128
 make -j$(nproc)
 ./hashchaintable test_output
 ```
@@ -74,7 +79,7 @@ All parameters are compile-time constants for maximum efficiency:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| IMPLEMENTATION | 1 | Implementation version (1=multi-file, 2=single-file) |
+| IMPLEMENTATION | 1 | Implementation version (1=multi-file, 2=single-file, 3=in-memory) |
 | K_VALUE | 32 | Generate 2^K nonce-hash pairs (e.g., 32 = 4.3 billion) |
 | NONCE_SIZE | 6 | Size of each nonce in bytes |
 | HASH_SIZE | 10 | Size of hash in bytes (only prefix is computed) |
@@ -83,7 +88,7 @@ All parameters are compile-time constants for maximum efficiency:
 | NUM_WORKER_THREADS | 8 | Number of hash generation threads |
 | NUM_IO_THREADS | 2 | Number of I/O threads |
 | WORKER_BUFFER_SIZE | 65536 | Buffer size per worker in bytes |
-| MEMORY_LIMIT_MB | 2048 | Memory limit for Implementation 2 (in MB) |
+| MEMORY_LIMIT_MB | 2048 | Memory limit for Implementations 2 and 3 (in MB) |
 | ENABLE_BENCHMARKING | ON | Enable detailed performance statistics |
 
 ### Custom Configuration
@@ -681,33 +686,178 @@ Cache Statistics:
 4. **Single File Risk**: Corruption affects entire table (vs isolated buckets in V1)
 5. **Not Incremental**: Must pre-allocate entire file upfront
 
-### Comparison with Implementation 1
+# Implementation 3: In-Memory with Dynamic Nonce Size
 
-| Aspect | Implementation 1 | Implementation 2 |
-|--------|------------------|------------------|
-| Files Created | 16.7M files | 2 files (data + meta) |
-| File Descriptors | Up to 16.7M | 1 |
-| Memory Usage | ~2.6GB fixed | Configurable limit |
-| Preallocation | None | Required (~51GB) |
-| Seek Operations | Minimal (sequential per file) | More (offset-based) |
-| Best For | Rotating disks, small K | SSDs, large K, limited FDs |
-| Disk Format | Many small files | One large file |
+## Overview
 
-### When to Use Implementation 2
+Implementation 3 takes a fundamentally different approach by **generating the entire hash table in memory** with a **dynamically calculated nonce size** based on available memory.
+
+### Key Features
+
+- **Full In-Memory Generation**: Entire table stored in RAM during generation
+- **Dynamic Nonce Size**: Automatically reduces nonce bytes to fit memory limit
+- **Single Write**: All disk I/O happens at finalization
+- **Reorganization**: Entries reorganized by bucket when writing to disk
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Worker Threads                        │
+├─────────────────────────────────────────────────────────┤
+│  Generate nonces → Compute hashes → Write to linear     │
+│                                      memory array       │
+└─────────────────────────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────┐
+│              Linear Memory Layout                       │
+│  [Entry 0][Entry 1][Entry 2]...[Entry 2^K-1]          │
+│   Position = Nonce Counter Value                        │
+└─────────────────────────────────────────────────────────┘
+                         ↓
+              On Finalize: Reorganize
+                         ↓
+┌─────────────────────────────────────────────────────────┐
+│           Bucket-Organized File                         │
+│  [Bucket 0 entries...][Bucket 1 entries...]...         │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Dynamic Nonce Size Calculation
+
+Implementation 3 automatically calculates the maximum nonce size that fits in the configured memory limit:
+
+```
+Effective Nonce Size = min(NONCE_SIZE, MEMORY_LIMIT / 2^K)
+```
+
+**Example calculations:**
+
+| K Value | Table Size | Memory Limit | Effective Nonce Size |
+|---------|------------|--------------|---------------------|
+| 16 | 65,536 | 128 MB | 6 bytes (full) |
+| 20 | 1,048,576 | 512 MB | 6 bytes (full) |
+| 24 | 16,777,216 | 512 MB | 30 bytes → 6 bytes (capped) |
+| 28 | 268,435,456 | 2048 MB | 7 bytes → 6 bytes (capped) |
+| 32 | 4,294,967,296 | 4096 MB | 0.95 bytes → 0 bytes (error!) |
+
+If the calculated size is less than 1 byte, generation fails with an error.
+
+### Workflow
+
+1. **Initialization**
+   - Calculate effective nonce size based on memory limit and K value
+   - Allocate linear memory array: `tableSize * effectiveNonceSize` bytes
+   - Initialize metadata for all buckets
+
+2. **Generation Phase**
+   - Worker threads generate nonces sequentially (counter-based)
+   - Compute BLAKE3 hash for each nonce
+   - Store nonce at linear position = counter value
+   - Track bucket statistics but don't organize by bucket yet
+
+3. **Finalization Phase**
+   - Scan through linear memory once
+   - Group entries by bucket ID (recompute hash prefix)
+   - Write to disk in bucket-organized format
+   - Create metadata file with bucket counts and offsets
+
+### Build Example
+
+```bash
+# Implementation 3: In-memory with dynamic nonce size
+mkdir build && cd build
+cmake .. -DIMPLEMENTATION=3 -DK_VALUE=20 -DMEMORY_LIMIT_MB=1024
+make -j$(nproc)
+```
+
+### File Format
+
+Same as Implementation 2 - single `buckets.dat` file with bucket-based offsets and `buckets.meta` metadata file.
+
+**Metadata Differences:**
+```
+[4 bytes] Version (3 for Implementation 3)
+[8 bytes] Bucket count
+[4 bytes] Effective nonce size (IMPORTANT: may be < configured size!)
+For each bucket:
+  [8 bytes] Entry count
+  [8 bytes] File offset
+```
+
+### Performance Characteristics
+
+**Advantages:**
+- ✅ Zero disk I/O during generation (fastest generation phase)
+- ✅ Automatically adapts nonce size to memory
+- ✅ Simple linear memory layout
+- ✅ Single write operation at end
+- ✅ No file descriptor limits
+
+**Disadvantages:**
+- ❌ Requires all data to fit in RAM
+- ❌ May reduce nonce size (less preimage space)
+- ❌ Reorganization overhead at finalization
+- ❌ Not suitable for extremely large K values
+- ❌ File still requires full bucket space (can be large)
+
+### Memory Requirements
+
+Total memory needed:
+```
+Memory = 2^K × effectiveNonceSize + overhead
+```
+
+**Examples:**
+
+- K=20, 6 bytes: ~6 MB
+- K=24, 6 bytes: ~96 MB
+- K=28, 6 bytes: ~1.5 GB
+- K=32, 4 bytes: ~16 GB (reduced from 6 bytes)
+
+### Comparison of All Implementations
+
+| Aspect | Implementation 1 | Implementation 2 | Implementation 3 |
+|--------|------------------|------------------|------------------|
+| **Storage** |
+| Files Created | 16.7M files | 2 files | 2 files |
+| File Descriptors | Up to 16.7M | 1 | 1 |
+| Disk Format | Many small files | One large file | One large file |
+| Preallocation | None | Required (~51GB) | None (sparse write) |
+| **Memory** |
+| Memory Usage | ~2.6GB fixed | Configurable LRU cache | Full table in RAM |
+| Memory Model | Buffer-based | Cache-based | Full in-memory |
+| Nonce Size | Fixed | Fixed | Dynamic (adapts) |
+| **Performance** |
+| Write Speed | Fast (parallel) | Medium (cached) | Fastest (deferred) |
+| Seek Operations | Minimal | Many | None during gen |
+| Disk I/O Pattern | Many small writes | Cached writes | Single bulk write |
+| Finalization | Instant | Fast | Medium (reorganize) |
+| **Best For** |
+| Use Case | Rotating disks | SSDs, large K | Small K, max speed |
+| Storage Type | HDD-friendly | SSD-friendly | RAM-friendly |
+| Scale | Small K (<28) | Large K | Limited by RAM |
+
+### When to Use Implementation 3
+
+Choose Implementation 3 when:
+- ✅ K value is small enough to fit in RAM (K ≤ 28)
+- ✅ Want absolute fastest generation phase
+- ✅ Have abundant RAM available
+- ✅ Don't mind reduced nonce size
+- ✅ Can tolerate reorganization time at end
 
 Choose Implementation 2 when:
-- ✅ Bucket count exceeds filesystem limits (>1M files)
-- ✅ Using SSD or NVMe storage
-- ✅ Need predictable memory usage
-- ✅ Want single portable file
-- ✅ Have disk space for pre-allocation
+- ✅ K value too large for RAM but need single file
+- ✅ Need full nonce size preserved
+- ✅ Using SSD storage
+- ✅ Want predictable memory usage
 
 Choose Implementation 1 when:
 - ✅ Using rotating disks
-- ✅ Small bucket count (<100K files)
-- ✅ Want fastest write speed
-- ✅ Need incremental generation
+- ✅ Need maximum write throughput
 - ✅ Filesystem handles many files well
+- ✅ Want incremental generation
 
 ---
 
