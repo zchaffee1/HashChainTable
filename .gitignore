@@ -1,1 +1,25 @@
-/target
+# Build directories
+build/
+cmake-build-*/
+*.o
+*.a
+
+# Executables
+hashchaintable
+
+# Generated files
+*.bin
+*.dat
+buckets/
+temp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
