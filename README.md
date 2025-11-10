@@ -52,14 +52,18 @@ Example with 3-byte prefix:
 ### Quick Start
 
 ```bash
-# Default build (K=32, benchmarking enabled)
+# Implementation 1: Multi-file (default)
 mkdir build && cd build
-cmake ..
+cmake .. -DIMPLEMENTATION=1
+make -j$(nproc)
+
+# Implementation 2: Single-file with memory limit
+mkdir build && cd build
+cmake .. -DIMPLEMENTATION=2 -DMEMORY_LIMIT_MB=2048
 make -j$(nproc)
 
 # Test build (K=24 for faster testing)
-mkdir build_test && cd build_test
-cmake .. -DK_VALUE=24
+cmake .. -DIMPLEMENTATION=2 -DK_VALUE=24 -DMEMORY_LIMIT_MB=512
 make -j$(nproc)
 ./hashchaintable test_output
 ```
@@ -70,6 +74,7 @@ All parameters are compile-time constants for maximum efficiency:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| IMPLEMENTATION | 1 | Implementation version (1=multi-file, 2=single-file) |
 | K_VALUE | 32 | Generate 2^K nonce-hash pairs (e.g., 32 = 4.3 billion) |
 | NONCE_SIZE | 6 | Size of each nonce in bytes |
 | HASH_SIZE | 10 | Size of hash in bytes (only prefix is computed) |
@@ -78,19 +83,30 @@ All parameters are compile-time constants for maximum efficiency:
 | NUM_WORKER_THREADS | 8 | Number of hash generation threads |
 | NUM_IO_THREADS | 2 | Number of I/O threads |
 | WORKER_BUFFER_SIZE | 65536 | Buffer size per worker in bytes |
+| MEMORY_LIMIT_MB | 2048 | Memory limit for Implementation 2 (in MB) |
 | ENABLE_BENCHMARKING | ON | Enable detailed performance statistics |
 
 ### Custom Configuration
 
 ```bash
+# Implementation 1 with custom settings
 mkdir build && cd build
 cmake .. \
+  -DIMPLEMENTATION=1 \
   -DK_VALUE=24 \
   -DNONCE_SIZE=6 \
   -DBUCKET_PREFIX_SIZE=3 \
   -DNUM_WORKER_THREADS=16 \
   -DNUM_IO_THREADS=4 \
   -DENABLE_BENCHMARKING=ON
+make -j$(nproc)
+
+# Implementation 2 with memory limit
+cmake .. \
+  -DIMPLEMENTATION=2 \
+  -DK_VALUE=24 \
+  -DMEMORY_LIMIT_MB=4096 \
+  -DNUM_WORKER_THREADS=16
 make -j$(nproc)
 ```
 
@@ -447,6 +463,251 @@ These would be explored in future implementations:
 - **Memory-Mapped I/O**: Reduce system call overhead
 - **Compression**: Compress buckets on the fly
 - **Distribution**: Spread generation across multiple machines
+
+---
+
+# Implementation 2: Single-File with Offset-Based Storage
+
+## Approach
+
+Implementation 2 addresses the file descriptor limitations of Implementation 1 by storing all buckets in a **single dense file** with **fixed offsets** and **memory-limited caching**.
+
+### Key Design Decisions
+
+1. **Single Data File**: All buckets stored in one contiguous file
+2. **Fixed Offsets**: Each bucket at offset = bucketId × bucketCapacity × nonceSize
+3. **Dense Allocation**: File pre-allocated (not sparse) for guaranteed space
+4. **LRU Cache**: Memory-limited cache evicts least-recently-used buckets
+5. **Metadata File**: Separate file tracks entry counts per bucket
+
+### Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Main Program (V2)                         │
+│  - Similar worker/IO threading model                        │
+│  - Memory limit parameter                                    │
+└─────────────────────────────────────────────────────────────┘
+                          │
+         ┌────────────────┴────────────────┐
+         │                                  │
+         ▼                                  ▼
+┌──────────────────┐              ┌──────────────────┐
+│  Worker Pool     │              │   I/O Pool       │
+│  (N threads)     │              │  (M threads)     │
+└──────────────────┘              └──────────────────┘
+         │                                  │
+         │ Process & sort                   │ Write sorted entries
+         └──────────────────┬───────────────┘
+                            ▼
+              ┌─────────────────────────────┐
+              │   BucketManagerV2          │
+              │  - LRU cache (memory limit) │
+              │  - Lazy bucket loading      │
+              │  - Offset-based writes      │
+              └─────────────────────────────┘
+                            │
+         ┌──────────────────┴──────────────────┐
+         ▼                                      ▼
+┌──────────────────┐                  ┌──────────────────┐
+│  buckets.dat     │                  │  buckets.meta    │
+│  Single file:    │                  │  Binary metadata:│
+│  [Bucket 0 data] │                  │  - Entry counts  │
+│  [Bucket 1 data] │                  │  - File offsets  │
+│  [Bucket 2 data] │                  │  - Version info  │
+│  ...             │                  └──────────────────┘
+│  [Bucket N data] │
+└──────────────────┘
+```
+
+### Detailed Workflow
+
+#### Phase 1: Initialization & Preallocation
+```cpp
+1. Create output directory
+2. Calculate total file size: numBuckets × bucketCapacity × nonceSize
+   For K=32, 3-byte prefix: 16.7M × 512 × 6 = ~51 GB
+3. Pre-allocate dense file:
+   a. Try posix_fallocate on Linux (fast, instant)
+   b. Fallback: Write zeros in 64MB chunks (slower but portable)
+4. Initialize metadata structure (in memory)
+5. Calculate fixed offset for each bucket
+```
+
+#### Phase 2: Worker Processing (Same as V1)
+```cpp
+For each chunk in worker's range:
+  1. Generate nonces
+  2. Hash with BLAKE3 (3-byte prefix only)
+  3. Build buffer: [(nonce, bucketID), ...]
+  4. Sort buffer by bucketID
+  5. Submit to I/O pool
+```
+
+#### Phase 3: I/O Processing with LRU Cache
+```cpp
+For each sorted buffer from workers:
+  For each entry:
+    1. Get bucket buffer from cache (or load if not cached)
+    2. If cache full and need new bucket:
+       a. Find LRU bucket (lowest access time)
+       b. Flush LRU bucket if dirty
+       c. Evict LRU bucket from cache
+    3. Add nonce to bucket buffer
+    4. Mark buffer as dirty
+    5. Update access time
+    6. If bucket full: flush immediately
+```
+
+#### Phase 4: Bucket Flushing
+```cpp
+To flush a bucket:
+  1. Calculate file offset: bucketId × bucketCapacity × nonceSize
+  2. Seek to offset in data file
+  3. Write entryCount × nonceSize bytes
+  4. Update metadata (entry count)
+  5. Mark buffer as clean
+```
+
+#### Phase 5: Finalization
+```cpp
+1. Wait for all workers to complete
+2. Wait for all I/O operations
+3. Flush all cached buckets (dirty or not)
+4. Write metadata file:
+   - Version number
+   - Bucket count
+   - For each bucket: entry count, file offset
+5. Close data file
+```
+
+### File Formats
+
+**buckets.dat** (Dense Binary File):
+```
+Offset 0:              [Bucket 0: up to 512 nonces, 6 bytes each]
+Offset 3072:           [Bucket 1: up to 512 nonces, 6 bytes each]
+Offset 6144:           [Bucket 2: up to 512 nonces, 6 bytes each]
+...
+Offset (N×3072):       [Bucket N: up to 512 nonces, 6 bytes each]
+
+Total size for K=32, 3-byte prefix: ~51 GB
+```
+
+**buckets.meta** (Binary Metadata):
+```
+[4 bytes] Version (2 for Implementation 2)
+[8 bytes] Number of buckets
+For each bucket:
+  [2 bytes] Entry count (0-512)
+  [8 bytes] File offset
+
+Total size for 16.7M buckets: ~167 MB
+```
+
+### Memory Management
+
+**LRU Cache Strategy:**
+- Each bucket buffer occupies: bucketCapacity × nonceSize bytes
+- Default: 512 × 6 = 3KB per bucket
+- With 2GB memory limit: ~680,000 buckets can be cached
+- Access counter tracks recency (atomic uint64_t)
+- When limit reached: evict bucket with lowest access time
+
+**Memory Usage:**
+```
+Per-bucket buffer:     3 KB (512 × 6 bytes)
+Cached buckets:        memoryLimit / 3KB
+Metadata (all):        ~167 MB (16.7M × 10 bytes)
+Thread stacks:         ~80 MB (10 threads × 8MB)
+Total with 2GB limit:  ~2.25 GB
+```
+
+### Performance Characteristics
+
+**Time Complexity:**
+- Hash generation: O(2^K × H) - same as V1
+- Sorting: O(2^K × log(buffer_size)) - same as V1
+- I/O: O(2^K × (W + C)) where W = write time, C = cache miss penalty
+
+**Space Complexity:**
+- Memory: O(memoryLimit + metadata_size)
+- Disk: O(2^K × nonce_size) - same as V1
+
+**Bottlenecks:**
+1. **File Preallocation**: Can take minutes for 50+ GB (if posix_fallocate unavailable)
+2. **Cache Thrashing**: If working set > memory limit, frequent evictions
+3. **Seek Overhead**: Random seeks when bucket not cached (SSD recommended)
+
+### Benchmark Results
+
+Example configuration (K=24, 16.7M entries, 2GB memory):
+```
+Configuration:
+  K Value:               24 (2^24 = 16777216 entries)
+  Implementation:        2 (Single-file)
+  Memory Limit:          2048 MB
+  File Size:             ~97 MB (actual data used)
+  Worker Threads:        8
+  I/O Threads:           2
+
+Timing Statistics:
+  Total Time:            ~30 seconds
+  Preallocation:         ~5 seconds (posix_fallocate)
+  Hash Generation:       ~20 seconds (67%)
+  Sorting:               ~1 second (3%)
+  I/O Wait:              ~4 seconds (13%)
+
+Cache Statistics:
+  Cache Hits:            ~15.5M (92%)
+  Cache Misses:          ~1.2M (8%)
+  Cache Evictions:       ~500K
+  Hit Rate:              92%
+```
+
+### Advantages
+
+1. **No File Descriptor Limits**: Single file regardless of bucket count
+2. **Predictable Disk Usage**: Pre-allocated, no sparse files
+3. **Memory Control**: Explicit memory limit prevents OOM
+4. **Good for SSDs**: Seeks are cheap, single file reduces metadata overhead
+5. **Portable File Format**: Easy to transfer, verify, or distribute
+
+### Limitations
+
+1. **Preallocation Time**: Large files take time to allocate (K=32 = ~51GB)
+2. **Cache Sensitivity**: Performance degrades if working set > memory limit
+3. **Write Amplification**: Bucket writes may not align with filesystem blocks
+4. **Single File Risk**: Corruption affects entire table (vs isolated buckets in V1)
+5. **Not Incremental**: Must pre-allocate entire file upfront
+
+### Comparison with Implementation 1
+
+| Aspect | Implementation 1 | Implementation 2 |
+|--------|------------------|------------------|
+| Files Created | 16.7M files | 2 files (data + meta) |
+| File Descriptors | Up to 16.7M | 1 |
+| Memory Usage | ~2.6GB fixed | Configurable limit |
+| Preallocation | None | Required (~51GB) |
+| Seek Operations | Minimal (sequential per file) | More (offset-based) |
+| Best For | Rotating disks, small K | SSDs, large K, limited FDs |
+| Disk Format | Many small files | One large file |
+
+### When to Use Implementation 2
+
+Choose Implementation 2 when:
+- ✅ Bucket count exceeds filesystem limits (>1M files)
+- ✅ Using SSD or NVMe storage
+- ✅ Need predictable memory usage
+- ✅ Want single portable file
+- ✅ Have disk space for pre-allocation
+
+Choose Implementation 1 when:
+- ✅ Using rotating disks
+- ✅ Small bucket count (<100K files)
+- ✅ Want fastest write speed
+- ✅ Need incremental generation
+- ✅ Filesystem handles many files well
 
 ---
 
